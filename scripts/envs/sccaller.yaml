@@ -1,0 +1,12 @@
+channels:
+  - bioconda
+  - defaults
+  - conda-forge
+
+dependencies:
+  - python = 2.7
+  - sccaller = 2.0.0
+  - samtools = 1.9
+  - pysam = 0.15.1
+  - numpy = 1.16.2
+  

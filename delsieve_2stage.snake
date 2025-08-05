@@ -1,0 +1,695 @@
+"""
+Explanation of wildcards:
+
+fineTuneTypeIndelSieve: types of fine-tuning to perform for SIEVE defined in the configuration file, e.g., single thread, multi thread, etc.
+dataType: input data types, e.g., no CNVs, including CNVs, excluding CNVs, etc.
+datasetName: simulated dataset names, e.g., 0001, 0002, 0003...
+runTemplate: configuration templates for SIEVE.
+runTemplateStage1: configuration templates for SIEVE which will be the
+first stage of the two-stage strategy.
+runTemplateStage2: configuration templates for SIEVE which will be the
+second stage of the two-stage strategy.
+"""
+
+
+include: "scripts/constants.py"
+include: "scripts/utils.py"
+
+
+#########################################################
+#              Get categories of wildcards              #
+#########################################################
+
+SIMUDATASETNAMES = get_dataset_names(SIMUSNVSITESDIR, config["fineTune"]["indelsieve_simulator"]["subsample"])
+FINETUNETYPESINDELSIEVE = get_fine_tune_types(
+    config["fineTune"]["beast"],
+    config["benchmark"]["fineTuneTypes"]
+)
+SIMUDATATYPES = get_data_types(
+    config["benchmark"]["simulatedDataTypes"],
+    config["benchmark"]["simulation"]["dataTypes"]["CNVTypes"]
+)
+TEMPLATES, STAGE1TEMPLATES, STAGE2TEMPLATES, CONFIG2KEY = sieve_config_files_sanity_check(config["configFiles"]["indelsieve"]["setup"])
+
+wildcard_constraints:
+    fineTuneTypeIndelSieve='|'.join([re.escape(i) for i in FINETUNETYPESINDELSIEVE]) if FINETUNETYPESINDELSIEVE is not None and len(FINETUNETYPESINDELSIEVE) > 0 else NONE_PATTERN,
+    dataType='|'.join([re.escape(i) for i in SIMUDATATYPES]) if SIMUDATATYPES is not None and len(SIMUDATATYPES) > 0 else NONE_PATTERN,
+    datasetName='|'.join([re.escape(i) for i in SIMUDATASETNAMES]) if SIMUDATASETNAMES is not None and len(SIMUDATASETNAMES) > 0 else NONE_PATTERN,
+    runTemplate='|'.join([re.escape(i) for i in TEMPLATES]) if TEMPLATES is not None and len(TEMPLATES) > 0 else NONE_PATTERN,
+    runTemplateStage1='|'.join([re.escape(i) for i in STAGE1TEMPLATES]) if STAGE1TEMPLATES is not None and len(STAGE1TEMPLATES) > 0 else NONE_PATTERN,
+    runTemplateStage2='|'.join([re.escape(i) for i in STAGE2TEMPLATES]) if STAGE2TEMPLATES is not None and len(STAGE2TEMPLATES) > 0 else NONE_PATTERN
+
+
+########################################################
+#                                                      #
+#             IndelSIEVE - From candidates             #
+#                                                      #
+########################################################
+
+
+########################################################
+#        IndelSIEVE - From candidates - Stage 1        #
+########################################################
+
+# Rule: select candidate SNVs with datafilter
+rule selectCandidateSNVsForIndelSieve:
+    input:
+        # flagFile=SIMUDATATYPESDIR + "DONE_FLAG",
+        mpileupDir=SIMUDATATYPESDIR + "{dataType}/{datasetName}/" + config["benchmark"]["simulation"]["MPileUpDataDir"],
+        bamNames=f'{SCIPHINDIR}{config["benchmark"]["bamFileNamesWithoutNormal"]}.{{datasetName}}'
+    output:
+        protected(INDELSIEVEFROMCANDIDATEPHYINFDIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplate}/{datasetName}/readCounts.tsv")
+    params:
+        dataFilter=config["tools"]["dataFilter"],
+        meanAlleleFreq=config["fineTune"]["dataFilter"]["meanAlleleFreq"],
+        mpileupFile=lambda wildcards, input: getMPileupWithoutNormal(
+            wildcards,
+            input,
+        )
+    shell:
+        "{params.dataFilter} "
+        "--cellNames {input.bamNames} "
+        "--in {params.mpileupFile} "
+        "--mff {params.meanAlleleFreq} "
+        "-o {output}"
+
+# Rule: integrate reads data from candidates into templates for IndelSIEVE
+rule integrateCandidateSNVsForIndelSieve:
+    input:
+        cellNames=SIMUTUMORCELLNAMES,
+        data=INDELSIEVEFROMCANDIDATEPHYINFDIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplate}/{datasetName}/readCounts.tsv"
+    output:
+        protected(INDELSIEVEFROMCANDIDATEPHYINFDIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplate}/{datasetName}/indelsieve" + config["configFiles"]["indelsieve"]["suffix"])
+    params:
+        dataCollector=config["tools"]["applauncher"] + " DataCollectorLauncher",
+        templates=config["configFiles"]["indelsieve"]["dir"] + "{runTemplate}" + config["configFiles"]["indelsieve"]["suffix"]
+    shell:
+        "{params.dataCollector} "
+        "-cell {input.cellNames} "
+        "-data {input.data} "
+        "-template {params.templates} "
+        "-out {output}"
+
+# Rule: perfrom phylogenetic inference with IndelSIEVE using Sciphi candicate SNVs
+rule runIndelSieveWithCandidateSNVsPhyloInf:
+    input:
+        rawData=INDELSIEVEFROMCANDIDATEPHYINFDIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplate}/{datasetName}/readCounts.tsv",
+        configuredData=INDELSIEVEFROMCANDIDATEPHYINFDIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplate}/{datasetName}/indelsieve" + config["configFiles"]["indelsieve"]["suffix"]
+    output:
+        trees=protected(INDELSIEVEFROMCANDIDATEPHYINFDIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplate}/{datasetName}/indelsieve.trees"),
+        mcmclog=protected(INDELSIEVEFROMCANDIDATEPHYINFDIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplate}/{datasetName}/indelsieve.log"),
+        state=protected(INDELSIEVEFROMCANDIDATEPHYINFDIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplate}/{datasetName}/indelsieve" + config["configFiles"]["indelsieve"]["suffix"] + ".state")
+    params:
+        beast=config["tools"]["beast"],
+        seed=lambda wildcards: get_dict_values(
+            config,
+            ["fineTune", "beast", wildcards.fineTuneTypeIndelSieve, "seed"]
+        ),
+        prefix=INDELSIEVEFROMCANDIDATEPHYINFDIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplate}/{datasetName}/"
+    threads:
+        lambda wildcards, input: get_thread_num_for_sieve(
+            input.rawData,
+            get_dict_values(
+                config,
+                ["fineTune", "beast", wildcards.fineTuneTypeIndelSieve, "nrOfSitesPerThreadStage1"]
+            )
+        )
+    log:
+        INDELSIEVEFROMCANDIDATEPHYINFDIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplate}/{datasetName}/mcmc.log"
+    priority:
+        100
+    benchmark:
+        repeat(EFFICIENCYINDELSIEVEDIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplate}/{datasetName}.tsv", config["benchmark"]["efficiency"]["repetition"])
+    shell:
+        "{params.beast} "
+        "-overwrite "
+        "-seed {params.seed} "
+        "-threads {threads} "
+        "-prefix {params.prefix} "
+        "{input.configuredData} "
+        "&>{log}"
+
+# Rule: perfrom tree annotation with IndelSIEVE using candicate SNVs
+rule runIndelSieveWithCandidateSNVsTreeAnnotation:
+    input:
+        INDELSIEVEFROMCANDIDATEPHYINFDIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplate}/{datasetName}/indelsieve.trees"
+    output:
+        tree=protected(INDELSIEVEFROMCANDIDATEPHYINFDIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplate}/{datasetName}/indelsieve.tree"),
+        simpleTree=protected(INDELSIEVEFROMCANDIDATEPHYINFDIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplate}/{datasetName}/indelsieve_simple.tree")
+    params:
+        treeAnnotator=config["tools"]["applauncher"] + " ScsTreeAnnotatorLauncher",
+        burnIn=config["fineTune"]["treeAnnotator"]["burnIn"],
+        log=INDELSIEVEFROMCANDIDATEPHYINFDIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplate}/{datasetName}/process_tree.out"
+    log:
+        INDELSIEVEFROMCANDIDATEPHYINFDIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplate}/{datasetName}/process_tree.log"
+    shell:
+        "{params.treeAnnotator} "
+        "-burnin {params.burnIn} "
+        "-simpleTree "
+        "{input} "
+        "{output.tree} "
+        "&>{log}"
+
+# Rule: perfrom variant calling with IndelSIEVE using Sciphi candicate SNVs
+rule runIndelSieveWithCandidateSNVsVarCall:
+    input:
+        mcmclog=INDELSIEVEFROMCANDIDATEPHYINFDIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplate}/{datasetName}/indelsieve.log",
+        config=INDELSIEVEFROMCANDIDATEPHYINFDIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplate}/{datasetName}/indelsieve" + config["configFiles"]["indelsieve"]["suffix"],
+        tree=INDELSIEVEFROMCANDIDATEPHYINFDIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplate}/{datasetName}/indelsieve.tree"
+    output:
+        estimates=protected(INDELSIEVEFROMCANDIDATEVARCALDIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplate}/{datasetName}/indelsieve.estimates"),
+        files=protected(INDELSIEVEFROMCANDIDATEVARCALDIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplate}/{datasetName}/files")
+    params:
+        variantCaller=config["tools"]["applauncher"] + " VariantCallerLauncher",
+        burnIn=config["fineTune"]["variantCaller"]["burnIn"],
+        estimates=config["fineTune"]["variantCaller"]["estimates"],
+        prefix=INDELSIEVEFROMCANDIDATEVARCALDIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplate}/{datasetName}/"
+    threads:
+        config["fineTune"]["variantCaller"]["threads"]
+    log:
+        INDELSIEVEFROMCANDIDATEVARCALDIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplate}/{datasetName}/process_varcall.log"
+    shell:
+        "{params.variantCaller} "
+        "-details "
+        "-burnin {params.burnIn} "
+        "-threads {threads} "
+        "-estimates {params.estimates} "
+        "-mcmclog {input.mcmclog} "
+        "-config {input.config} "
+        "-tree {input.tree} "
+        "-prefix {params.prefix} "
+        "&>{log} && "
+        "ls {params.prefix} > {output.files}"
+
+
+########################################################
+#        IndelSIEVE - From candidates - Stage 2        #
+########################################################
+
+# Rule: update templates for stage 2 from results of stage 1
+rule updateStage2ConfigCandidateSNVsForIndelSieve:
+    input:
+        estimates=INDELSIEVEFROMCANDIDATEVARCALDIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplateStage1}/{datasetName}/indelsieve.estimates",
+        files=INDELSIEVEFROMCANDIDATEVARCALDIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplateStage1}/{datasetName}/files",
+        simpleTree=INDELSIEVEFROMCANDIDATEPHYINFDIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplateStage1}/{datasetName}/indelsieve_simple.tree"
+    output:
+        protected(INDELSIEVEFROMCANDIDATEPHYINFSTAGE2DIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplateStage1}-{runTemplateStage2}/{datasetName}/stage2_template" + config["configFiles"]["indelsieve"]["suffix"])
+    params:
+        template1=config["configFiles"]["indelsieve"]["dir"] + "{runTemplateStage1}" + config["configFiles"]["indelsieve"]["suffix"],
+        template2=lambda wildcards: config["configFiles"]["indelsieve"]["dir"] + CONFIG2KEY[f"{wildcards.runTemplateStage1}-{wildcards.runTemplateStage2}"]["file"] + config["configFiles"]["indelsieve"]["suffix"],
+        bgNum=lambda wildcards: "" if get_dict_value(CONFIG2KEY[f"{wildcards.runTemplateStage1}-{wildcards.runTemplateStage2}"], "bgNum", default=None) is None else get_dict_value(CONFIG2KEY[f"{wildcards.runTemplateStage1}-{wildcards.runTemplateStage2}"], "bgNum", prefix="--bgNum "),
+        bg2varRatio=lambda wildcards: "" if get_dict_value(CONFIG2KEY[f"{wildcards.runTemplateStage1}-{wildcards.runTemplateStage2}"], "bg2varRatio", default=None) is None else get_dict_value(CONFIG2KEY[f"{wildcards.runTemplateStage1}-{wildcards.runTemplateStage2}"], "bg2varRatio", prefix="--bg2varRatio ")
+    shell:
+        "python scripts/set_up_stage2_from_stage1.py "
+        "--tree {input.simpleTree} "
+        "--estimates {input.estimates} "
+        "--results {input.files} "
+        "--template1 {params.template1} "
+        "--template2 {params.template2} {params.bgNum} {params.bg2varRatio} "
+        "--out {output}"
+
+# Rule: integrate reads data from Sciphi candicate SNVs into templates for stage 2 for IndelSIEVE
+rule integrateStage2CandidateSNVsForIndelSieve:
+    input:
+        cellNames=SIMUTUMORCELLNAMES,
+        data=INDELSIEVEFROMCANDIDATEPHYINFDIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplateStage1}/{datasetName}/readCounts.tsv",
+        template=INDELSIEVEFROMCANDIDATEPHYINFSTAGE2DIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplateStage1}-{runTemplateStage2}/{datasetName}/stage2_template" + config["configFiles"]["indelsieve"]["suffix"]
+    output:
+        protected(INDELSIEVEFROMCANDIDATEPHYINFSTAGE2DIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplateStage1}-{runTemplateStage2}/{datasetName}/indelsieve" + config["configFiles"]["indelsieve"]["suffix"])
+    params:
+        dataCollector=config["tools"]["applauncher"] + " DataCollectorLauncher",
+    shell:
+        "{params.dataCollector} "
+        "-cell {input.cellNames} "
+        "-data {input.data} "
+        "-template {input.template} "
+        "-out {output}"
+
+# Rule: perfrom phylogenetic inference for stage 2 with IndelSIEVE using Sciphi candicate SNVs
+rule runIndelSieveWithCandidateSNVsPhyloInfStage2:
+    input:
+        rawData=INDELSIEVEFROMCANDIDATEPHYINFDIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplateStage1}/{datasetName}/readCounts.tsv",
+        configuredData=INDELSIEVEFROMCANDIDATEPHYINFSTAGE2DIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplateStage1}-{runTemplateStage2}/{datasetName}/indelsieve" + config["configFiles"]["indelsieve"]["suffix"]
+    output:
+        trees=protected(INDELSIEVEFROMCANDIDATEPHYINFSTAGE2DIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplateStage1}-{runTemplateStage2}/{datasetName}/indelsieve.trees"),
+        mcmclog=protected(INDELSIEVEFROMCANDIDATEPHYINFSTAGE2DIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplateStage1}-{runTemplateStage2}/{datasetName}/indelsieve.log"),
+        state=protected(INDELSIEVEFROMCANDIDATEPHYINFSTAGE2DIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplateStage1}-{runTemplateStage2}/{datasetName}/indelsieve" + config["configFiles"]["indelsieve"]["suffix"] + ".state")
+    params:
+        beast=config["tools"]["beast"],
+        seed=lambda wildcards: get_dict_values(
+            config,
+            ["fineTune", "beast", wildcards.fineTuneTypeIndelSieve, "seed"]
+        ),
+        prefix=INDELSIEVEFROMCANDIDATEPHYINFSTAGE2DIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplateStage1}-{runTemplateStage2}/{datasetName}/",
+        log=INDELSIEVEFROMCANDIDATEPHYINFSTAGE2DIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplateStage1}-{runTemplateStage2}/{datasetName}/out"
+    threads:
+        lambda wildcards, input: get_thread_num_for_sieve(
+            input.rawData,
+            get_dict_values(
+                config,
+                ["fineTune", "beast", wildcards.fineTuneTypeIndelSieve, "nrOfSitesPerThreadStage2"]
+            )
+        )
+    log:
+        INDELSIEVEFROMCANDIDATEPHYINFSTAGE2DIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplateStage1}-{runTemplateStage2}/{datasetName}/mcmc.out"
+    benchmark:
+        repeat(EFFICIENCYINDELSIEVEDIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplateStage1}-{runTemplateStage2}/{datasetName}.tsv", config["benchmark"]["efficiency"]["repetition"])
+    shell:
+        "{params.beast} "
+        "-overwrite "
+        "-seed {params.seed} "
+        "-threads {threads} "
+        "-prefix {params.prefix} "
+        "{input.configuredData} "
+        "&>{log}"
+
+# Rule: perfrom tree annotation for stage 2 with IndelSIEVE using Sciphi candicate SNVs
+rule runIndelSieveWithCandidateSNVsTreeAnnotationStage2:
+    input:
+        INDELSIEVEFROMCANDIDATEPHYINFSTAGE2DIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplateStage1}-{runTemplateStage2}/{datasetName}/indelsieve.trees"
+    output:
+        tree=protected(INDELSIEVEFROMCANDIDATEPHYINFSTAGE2DIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplateStage1}-{runTemplateStage2}/{datasetName}/indelsieve.tree"),
+        simpleTree=protected(INDELSIEVEFROMCANDIDATEPHYINFSTAGE2DIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplateStage1}-{runTemplateStage2}/{datasetName}/indelsieve_simple.tree")
+    params:
+        treeAnnotator=config["tools"]["applauncher"] + " ScsTreeAnnotatorLauncher",
+        burnIn=config["fineTune"]["treeAnnotator"]["burnIn"],
+        log=INDELSIEVEFROMCANDIDATEPHYINFSTAGE2DIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplateStage1}-{runTemplateStage2}/{datasetName}/process_tree.out"
+    log:
+        INDELSIEVEFROMCANDIDATEPHYINFSTAGE2DIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplateStage1}-{runTemplateStage2}/{datasetName}/process_tree.log"
+    shell:
+        "{params.treeAnnotator} "
+        "-burnin {params.burnIn} "
+        "-simpleTree "
+        "{input} "
+        "{output.tree} "
+        "&>{log}"
+
+# Rule: perfrom variant calling for stage 2 with IndelSIEVE using Sciphi candicate SNVs
+rule runIndelSieveWithCandidateSNVsVarCallStage2:
+    input:
+        mcmclog=INDELSIEVEFROMCANDIDATEPHYINFSTAGE2DIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplateStage1}-{runTemplateStage2}/{datasetName}/indelsieve.log",
+        config=INDELSIEVEFROMCANDIDATEPHYINFSTAGE2DIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplateStage1}-{runTemplateStage2}/{datasetName}/indelsieve" + config["configFiles"]["indelsieve"]["suffix"],
+        tree=INDELSIEVEFROMCANDIDATEPHYINFSTAGE2DIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplateStage1}-{runTemplateStage2}/{datasetName}/indelsieve.tree"
+    output:
+        estimates=protected(INDELSIEVEFROMCANDIDATEVARCALSTAGE2DIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplateStage1}-{runTemplateStage2}/{datasetName}/indelsieve.estimates"),
+        files=protected(INDELSIEVEFROMCANDIDATEVARCALSTAGE2DIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplateStage1}-{runTemplateStage2}/{datasetName}/stage2_files")
+    params:
+        variantCaller=config["tools"]["applauncher"] + " VariantCallerLauncher",
+        burnIn=config["fineTune"]["variantCaller"]["burnIn"],
+        prefix=INDELSIEVEFROMCANDIDATEVARCALSTAGE2DIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplateStage1}-{runTemplateStage2}/{datasetName}/"
+    threads:
+        config["fineTune"]["variantCaller"]["threads"]
+    log:
+        INDELSIEVEFROMCANDIDATEVARCALSTAGE2DIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplateStage1}-{runTemplateStage2}/{datasetName}/process_varcall.out"
+    shell:
+        "{params.variantCaller} "
+        "-details "
+        "-burnin {params.burnIn} "
+        "-threads {threads} "
+        "-estimates median "
+        "-mcmclog {input.mcmclog} "
+        "-config {input.config} "
+        "-tree {input.tree} "
+        "-prefix {params.prefix} "
+        "&>{log} && "
+        "ls {params.prefix} > {output.files}"
+
+
+########################################################
+#            Gather candidate variant sites            #
+########################################################
+
+# Rule: gather candidate variant sites for testing purpose
+rule gatherCandidateVariantSites:
+    input:
+        expand(INDELSIEVEFROMCANDIDATEPHYINFDIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplateStage1}/{datasetName}/readCounts.tsv", fineTuneTypeIndelSieve=FINETUNETYPESINDELSIEVE, dataType=SIMUDATATYPES, runTemplateStage1=STAGE1TEMPLATES, datasetName=SIMUDATASETNAMES)
+    output:
+        protected(INDELSIEVEDIR + "CANDIDATE_COLLECTED")
+    shell:
+        "touch {output}"
+
+
+########################################################
+#      Gather the number of sites from IndelSIEVE      #
+########################################################
+
+rule gatherSitesInfoIndelSieve:
+    input:
+        trueSites=expand(SIMUDATATYPESDIR + "{dataType}/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVSitesNamesPre"], dataType=SIMUDATATYPES, datasetName=SIMUDATASETNAMES),
+        candidateSites=expand(INDELSIEVEFROMCANDIDATEPHYINFDIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplateStage1}/{datasetName}/readCounts.tsv", fineTuneTypeIndelSieve=FINETUNETYPESINDELSIEVE, dataType=SIMUDATATYPES, runTemplateStage1=STAGE1TEMPLATES, datasetName=SIMUDATASETNAMES)
+    output:
+        protected(ANALYSISSITESINFODIR + "from_indelsieve.tsv")
+    params:
+        datasetNames=SIMUDATASETNAMES,
+        tool=CONFIG2KEY,
+        snvType=config["benchmark"]["analysis"]["candidateSNVs"],
+        toolSetup=STAGE1TEMPLATES,
+        fineTuneType=FINETUNETYPESINDELSIEVE,
+        cnvRate=str(config["fineTune"]["simulateCNVs"]["prob"]),
+        dataType=SIMUDATATYPES,
+        cellNum=config["benchmark"]["analysis"]["cellNum"],
+        covMean=config["benchmark"]["analysis"]["covMean"],
+        covVariance=config["benchmark"]["analysis"]["covVariance"],
+        effSeqErrRate=config["benchmark"]["analysis"]["effSeqErrRate"],
+        adoRate=config["benchmark"]["analysis"]["adoRate"],
+        mutationRate=config["benchmark"]["analysis"]["mutationRate"],
+        deletionRate=config["benchmark"]["analysis"]["deletionRate"],
+        insertionRate=config["benchmark"]["analysis"]["insertionRate"],
+        doubletRate=config["benchmark"]["analysis"]["doubletRate"],
+        typeOfQuery=config["benchmark"]["indelsieve"]["typeOfQuery"]
+    script:
+        "scripts/gather_sites_info_part.py"
+
+
+########################################################
+#             Gather trees from IndelSIEVE             #
+########################################################
+
+# Rule: gather inferred trees from IndelSIEVE with candidate SNVs
+rule gatherIndelSieveTreesWithCandidateSNVs:
+    input:
+        inferredTrees=expand(INDELSIEVEFROMCANDIDATEPHYINFDIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplate}/{datasetName}/indelsieve_simple.tree", fineTuneTypeIndelSieve=FINETUNETYPESINDELSIEVE, dataType=SIMUDATATYPES, runTemplate=TEMPLATES, datasetName=SIMUDATASETNAMES),
+        trueTrees=expand(SIMUCONVERTEDTRUETREEDIR + config["benchmark"]["simulation"]["treesWithTrunkWithoutNormalDir"] + config["benchmark"]["simulation"]["treesPre"] + ".{datasetName}", datasetName=SIMUDATASETNAMES)
+    output:
+        protected(ANALYSISTREECOMPDIR + "from_indelsieve_" + config["benchmark"]["analysis"]["candidateSNVs"] + ".tsv")
+    params:
+        datasetNames=SIMUDATASETNAMES,
+        trueTreesDir=SIMUCONVERTEDTRUETREEDIR + config["benchmark"]["simulation"]["treesWithTrunkWithoutNormalDir"],
+        trueTreesPre=config["benchmark"]["simulation"]["treesPre"],
+        tool=CONFIG2KEY,
+        snvType=config["benchmark"]["analysis"]["candidateSNVs"],
+        toolSetup=TEMPLATES,
+        fineTuneType=FINETUNETYPESINDELSIEVE,
+        cnvRate=str(config["fineTune"]["simulateCNVs"]["prob"]),
+        dataType=SIMUDATATYPES,
+        cellNum=config["benchmark"]["analysis"]["cellNum"],
+        covMean=config["benchmark"]["analysis"]["covMean"],
+        covVariance=config["benchmark"]["analysis"]["covVariance"],
+        effSeqErrRate=config["benchmark"]["analysis"]["effSeqErrRate"],
+        adoRate=config["benchmark"]["analysis"]["adoRate"],
+        mutationRate=config["benchmark"]["analysis"]["mutationRate"],
+        deletionRate=config["benchmark"]["analysis"]["deletionRate"],
+        insertionRate=config["benchmark"]["analysis"]["insertionRate"],
+        doubletRate=config["benchmark"]["analysis"]["doubletRate"]
+    script:
+        "scripts/gather_inferred_trees_part.py"
+
+# Rule: gather inferred trees from IndelSIEVE stage 2 with candidate SNVs per configuration
+rule gatherIndelSieveStage2TreesWithCandidateSNVsPerConfig:
+    input:
+        inferredTrees=expand(INDELSIEVEFROMCANDIDATEPHYINFSTAGE2DIR + "{{fineTuneTypeIndelSieve}}/{{dataType}}/{runTemplateStage1}-{runTemplateStage2}/{{datasetName}}/indelsieve_simple.tree", zip, runTemplateStage1=STAGE1TEMPLATES, runTemplateStage2=STAGE2TEMPLATES),
+        trueTrees=SIMUCONVERTEDTRUETREEDIR + config["benchmark"]["simulation"]["treesWithTrunkWithoutNormalDir"] + config["benchmark"]["simulation"]["treesPre"] + ".{datasetName}"
+    output:
+        temp(ANALYSISTREECOMPDIR + "{fineTuneTypeIndelSieve}/{dataType}/{datasetName}/from_indelsieve_stage2_" + config["benchmark"]["analysis"]["candidateSNVs"] + ".tsv")
+    params:
+        datasetNames=lambda wildcards: [wildcards.datasetName],
+        trueTreesDir=SIMUCONVERTEDTRUETREEDIR + config["benchmark"]["simulation"]["treesWithTrunkWithoutNormalDir"],
+        trueTreesPre=config["benchmark"]["simulation"]["treesPre"],
+        tool=CONFIG2KEY,
+        snvType=config["benchmark"]["analysis"]["candidateSNVs"],
+        toolSetup=expand("{runTemplateStage1}-{runTemplateStage2}", zip, runTemplateStage1=STAGE1TEMPLATES, runTemplateStage2=STAGE2TEMPLATES),
+        fineTuneType=lambda wildcards: [wildcards.fineTuneTypeIndelSieve],
+        cnvRate=str(config["fineTune"]["simulateCNVs"]["prob"]),
+        dataType=lambda wildcards: [wildcards.dataType],
+        cellNum=config["benchmark"]["analysis"]["cellNum"],
+        covMean=config["benchmark"]["analysis"]["covMean"],
+        covVariance=config["benchmark"]["analysis"]["covVariance"],
+        effSeqErrRate=config["benchmark"]["analysis"]["effSeqErrRate"],
+        adoRate=config["benchmark"]["analysis"]["adoRate"],
+        mutationRate=config["benchmark"]["analysis"]["mutationRate"],
+        deletionRate=config["benchmark"]["analysis"]["deletionRate"],
+        insertionRate=config["benchmark"]["analysis"]["insertionRate"],
+        doubletRate=config["benchmark"]["analysis"]["doubletRate"]
+    script:
+        "scripts/gather_inferred_trees_part.py"
+
+# Rule: gather inferred trees from IndelSIEVE stage 2 with candidate SNVs
+rule gatherIndelSieveStage2TreesWithCandidateSNVs:
+    input:
+        expand(ANALYSISTREECOMPDIR + "{fineTuneTypeIndelSieve}/{dataType}/{datasetName}/from_indelsieve_stage2_" + config["benchmark"]["analysis"]["candidateSNVs"] + ".tsv", fineTuneTypeIndelSieve=FINETUNETYPESINDELSIEVE, dataType=SIMUDATATYPES, datasetName=SIMUDATASETNAMES)
+    output:
+        protected(ANALYSISTREECOMPDIR + "from_indelsieve_stage2_" + config["benchmark"]["analysis"]["candidateSNVs"] + ".tsv")
+    script:
+        "scripts/gather_inferred_trees.py"
+
+
+#########################################################
+#             Get estimates from IndelSIEVE             #
+#########################################################
+
+# Rule: get parameter estimates from IndelSIEVE with candidate SNVs
+rule getIndelSieveParamsWithCandidateSNVs:
+    input:
+        expand(INDELSIEVEFROMCANDIDATEVARCALDIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplate}/{datasetName}/indelsieve.estimates", fineTuneTypeIndelSieve=FINETUNETYPESINDELSIEVE, dataType=SIMUDATATYPES, runTemplate=TEMPLATES, datasetName=SIMUDATASETNAMES)
+    output:
+        protected(ANALYSISPARAMSDIR + "from_indelsieve_" + config["benchmark"]["analysis"]["candidateSNVs"] + ".tsv")
+    params:
+        cellNum=config["benchmark"]["analysis"]["cellNum"],
+        covMean=config["benchmark"]["analysis"]["covMean"],
+        covVariance=config["benchmark"]["analysis"]["covVariance"],
+        mutationRate=config["benchmark"]["analysis"]["mutationRate"],
+        toolSetup=TEMPLATES,
+        datasetNames=SIMUDATASETNAMES,
+        tool=CONFIG2KEY,
+        snvType=config["benchmark"]["analysis"]["candidateSNVs"],
+        fineTuneType=FINETUNETYPESINDELSIEVE,
+        cnvRate=str(config["fineTune"]["simulateCNVs"]["prob"]),
+        dataType=SIMUDATATYPES,
+        estimatesType=config["fineTune"]["variantCaller"]["estimates"],
+        doubletRate=config["benchmark"]["analysis"]["doubletRate"]
+    script:
+        "scripts/get_param_estimates_indelsieve.py"
+
+# Rule: get parameter estimates from IndelSIEVE stage 2 with candidate SNVs per configuration
+rule getIndelSieveStage2ParamsWithCandidateSNVsPerConfig:
+    input:
+        expand(INDELSIEVEFROMCANDIDATEVARCALSTAGE2DIR + "{{fineTuneTypeIndelSieve}}/{{dataType}}/{runTemplateStage1}-{runTemplateStage2}/{{datasetName}}/indelsieve.estimates", zip, runTemplateStage1=STAGE1TEMPLATES, runTemplateStage2=STAGE2TEMPLATES)
+    output:
+        temp(ANALYSISPARAMSDIR + "{fineTuneTypeIndelSieve}/{dataType}/{datasetName}/from_indelsieve_stage2_" + config["benchmark"]["analysis"]["candidateSNVs"] + ".tsv")
+    params:
+        cellNum=config["benchmark"]["analysis"]["cellNum"],
+        covMean=config["benchmark"]["analysis"]["covMean"],
+        covVariance=config["benchmark"]["analysis"]["covVariance"],
+        mutationRate=config["benchmark"]["analysis"]["mutationRate"],
+        toolSetup=expand("{runTemplateStage1}-{runTemplateStage2}", zip, runTemplateStage1=STAGE1TEMPLATES, runTemplateStage2=STAGE2TEMPLATES),
+        datasetNames=lambda wildcards: [wildcards.datasetName],
+        tool=CONFIG2KEY,
+        snvType=config["benchmark"]["analysis"]["candidateSNVs"],
+        fineTuneType=lambda wildcards: [wildcards.fineTuneTypeIndelSieve],
+        cnvRate=str(config["fineTune"]["simulateCNVs"]["prob"]),
+        dataType=lambda wildcards: [wildcards.dataType],
+        estimatesType=config["fineTune"]["variantCaller"]["estimates"],
+        doubletRate=config["benchmark"]["analysis"]["doubletRate"]
+    script:
+        "scripts/get_param_estimates_indelsieve.py"
+
+# Rule: get parameter estimates from IndelSIEVE stage 2 with candidate SNVs
+rule getIndelSieveStage2ParamsWithCandidateSNVs:
+    input:
+        expand(ANALYSISPARAMSDIR + "{fineTuneTypeIndelSieve}/{dataType}/{datasetName}/from_indelsieve_stage2_" + config["benchmark"]["analysis"]["candidateSNVs"] + ".tsv", fineTuneTypeIndelSieve=FINETUNETYPESINDELSIEVE, dataType=SIMUDATATYPES, datasetName=SIMUDATASETNAMES)
+    output:
+        protected(ANALYSISPARAMSDIR + "from_indelsieve_stage2_" + config["benchmark"]["analysis"]["candidateSNVs"] + ".tsv")
+    script:
+        "scripts/get_param_estimates.py"
+
+
+#########################################################
+#      Get variant calling results from IndelSIEVE      #
+#########################################################
+
+# Rule: gather variant calling results from IndelSIEVE with candidate SNVs
+rule gatherIndelSieveVarResultsCandidateSNVs:
+    input:
+        inputData=expand(INDELSIEVEFROMCANDIDATEPHYINFDIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplate}/{datasetName}/readCounts.tsv", fineTuneTypeIndelSieve=FINETUNETYPESINDELSIEVE, dataType=SIMUDATATYPES, runTemplate=TEMPLATES, datasetName=SIMUDATASETNAMES),
+        allFiles=expand(INDELSIEVEFROMCANDIDATEVARCALDIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplate}/{datasetName}/files", fineTuneTypeIndelSieve=FINETUNETYPESINDELSIEVE, dataType=SIMUDATATYPES, runTemplate=TEMPLATES, datasetName=SIMUDATASETNAMES),
+        trueCellNames=expand(f'{SIMUTUMORCELLNAMESDIR}{config["benchmark"]["simulation"]["tumorCellNamesPre"]}.{{datasetName}}', datasetName=SIMUDATASETNAMES),
+        trueSNVSites=expand(SIMUDATATYPESDIR + "{dataType}/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVSitesNamesPre"], dataType=SIMUDATATYPES, datasetName=SIMUDATASETNAMES),
+        trueSNVGenotypesNU=expand(SIMUDATATYPESDIR + "{dataType}/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVGenotypesNUPre"], dataType=SIMUDATATYPES, datasetName=SIMUDATASETNAMES),
+        trueSNVGenotypesTer=expand(SIMUDATATYPESDIR + "{dataType}/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVGenotypesTerPre"], dataType=SIMUDATATYPES, datasetName=SIMUDATASETNAMES)
+    output:
+        protected(ANALYSISVARCALLDIR + "from_indelsieve_" + config["benchmark"]["analysis"]["candidateSNVs"] + ".tsv")
+    params:
+        forSieve=True,
+        datasetNames=SIMUDATASETNAMES,
+        tool=CONFIG2KEY,
+        snvType=config["benchmark"]["analysis"]["candidateSNVs"],
+        toolSetup=TEMPLATES,
+        fineTuneType=FINETUNETYPESINDELSIEVE,
+        cnvRate=str(config["fineTune"]["simulateCNVs"]["prob"]),
+        dataType=SIMUDATATYPES,
+        cellNum=config["benchmark"]["analysis"]["cellNum"],
+        covMean=config["benchmark"]["analysis"]["covMean"],
+        covVariance=config["benchmark"]["analysis"]["covVariance"],
+        effSeqErrRate=config["benchmark"]["analysis"]["effSeqErrRate"],
+        adoRate=config["benchmark"]["analysis"]["adoRate"],
+        mutationRate=config["benchmark"]["analysis"]["mutationRate"],
+        deletionRate=config["benchmark"]["analysis"]["deletionRate"],
+        insertionRate=config["benchmark"]["analysis"]["insertionRate"],
+        doubletRate=config["benchmark"]["analysis"]["doubletRate"]
+    script:
+        "scripts/gather_variant_calling_results_part.py"
+
+# Rule: gather variant calling results from IndelSIEVE stage 2 with candidate SNVs per configuration
+rule gatherIndelSieveStage2VarResultsCandidateSNVsPerConfig:
+    input:
+        inputData=expand(INDELSIEVEFROMCANDIDATEPHYINFDIR + "{{fineTuneTypeIndelSieve}}/{{dataType}}/{runTemplateStage1}/{{datasetName}}/readCounts.tsv", runTemplateStage1=STAGE1TEMPLATES),
+        allFiles=expand(INDELSIEVEFROMCANDIDATEVARCALSTAGE2DIR + "{{fineTuneTypeIndelSieve}}/{{dataType}}/{runTemplateStage1}-{runTemplateStage2}/{{datasetName}}/stage2_files", zip, runTemplateStage1=STAGE1TEMPLATES, runTemplateStage2=STAGE2TEMPLATES),
+        trueCellNames=expand(f'{SIMUTUMORCELLNAMESDIR}{config["benchmark"]["simulation"]["tumorCellNamesPre"]}.{{datasetName}}', datasetName=SIMUDATASETNAMES),
+        trueSNVSites=SIMUDATATYPESDIR + "{dataType}/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVSitesNamesPre"],
+        trueSNVGenotypesNU=SIMUDATATYPESDIR + "{dataType}/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVGenotypesNUPre"],
+        trueSNVGenotypesTer=SIMUDATATYPESDIR + "{dataType}/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVGenotypesTerPre"]
+    output:
+        temp(ANALYSISVARCALLDIR + "{fineTuneTypeIndelSieve}/{dataType}/{datasetName}/from_indelsieve_stage2_" + config["benchmark"]["analysis"]["candidateSNVs"] + ".tsv")
+    params:
+        forSieve=True,
+        datasetNames=lambda wildcards: [wildcards.datasetName],
+        tool=CONFIG2KEY,
+        snvType=config["benchmark"]["analysis"]["candidateSNVs"],
+        toolSetup=expand("{runTemplateStage1}-{runTemplateStage2}", zip, runTemplateStage1=STAGE1TEMPLATES, runTemplateStage2=STAGE2TEMPLATES),
+        fineTuneType=lambda wildcards: [wildcards.fineTuneTypeIndelSieve],
+        cnvRate=str(config["fineTune"]["simulateCNVs"]["prob"]),
+        dataType=lambda wildcards: [wildcards.dataType],
+        cellNum=config["benchmark"]["analysis"]["cellNum"],
+        covMean=config["benchmark"]["analysis"]["covMean"],
+        covVariance=config["benchmark"]["analysis"]["covVariance"],
+        effSeqErrRate=config["benchmark"]["analysis"]["effSeqErrRate"],
+        adoRate=config["benchmark"]["analysis"]["adoRate"],
+        mutationRate=config["benchmark"]["analysis"]["mutationRate"],
+        deletionRate=config["benchmark"]["analysis"]["deletionRate"],
+        insertionRate=config["benchmark"]["analysis"]["insertionRate"],
+        doubletRate=config["benchmark"]["analysis"]["doubletRate"],
+    script:
+        "scripts/gather_variant_calling_results_part.py"
+
+# Rule: gather variant calling results from IndelSIEVE stage 2 with candidate SNVs
+rule gatherIndelSieveStage2VarResultsCandidateSNVs:
+    input:
+        allFiles=expand(ANALYSISVARCALLDIR + "{fineTuneTypeIndelSieve}/{dataType}/{datasetName}/from_indelsieve_stage2_" + config["benchmark"]["analysis"]["candidateSNVs"] + ".tsv", fineTuneTypeIndelSieve=FINETUNETYPESINDELSIEVE, dataType=SIMUDATATYPES, datasetName=SIMUDATASETNAMES)
+    output:
+        protected(ANALYSISVARCALLDIR + "from_indelsieve_stage2_" + config["benchmark"]["analysis"]["candidateSNVs"] + ".tsv")
+    script:
+        "scripts/gather_variant_calling_results.py"
+
+
+#########################################################
+#        Get ADO calling results from IndelSIEVE        #
+#########################################################
+
+# Rule: gather ADO calling results from IndelSIEVE with candidate SNVs
+rule gatherIndelSieveAdoResultsCandidateSNVs:
+    input:
+        allFiles=expand(INDELSIEVEFROMCANDIDATEVARCALDIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplate}/{datasetName}/files", fineTuneTypeIndelSieve=FINETUNETYPESINDELSIEVE, dataType=SIMUDATATYPES, runTemplate=TEMPLATES, datasetName=SIMUDATASETNAMES),
+        trueCellNames=expand(f'{SIMUTUMORCELLNAMESDIR}{config["benchmark"]["simulation"]["tumorCellNamesPre"]}.{{datasetName}}', datasetName=SIMUDATASETNAMES)
+    output:
+        protected(ANALYSISADOCALLDIR + "from_indelsieve_" + config["benchmark"]["analysis"]["candidateSNVs"] + ".tsv")
+    params:
+        datasetNames=SIMUDATASETNAMES,
+        tool=CONFIG2KEY,
+        snvType=config["benchmark"]["analysis"]["candidateSNVs"],
+        toolSetup=TEMPLATES,
+        fineTuneType=FINETUNETYPESINDELSIEVE,
+        cnvRate=str(config["fineTune"]["simulateCNVs"]["prob"]),
+        dataType=SIMUDATATYPES,
+        trueAdoStatesPre=SIMUTRUEADOSTATESDIR + config["benchmark"]["simulation"]["trueAdoStatesPre"],
+        cellNum=config["benchmark"]["analysis"]["cellNum"],
+        covMean=config["benchmark"]["analysis"]["covMean"],
+        covVariance=config["benchmark"]["analysis"]["covVariance"],
+        effSeqErrRate=config["benchmark"]["analysis"]["effSeqErrRate"],
+        adoRate=config["benchmark"]["analysis"]["adoRate"],
+        mutationRate=config["benchmark"]["analysis"]["mutationRate"],
+        deletionRate=config["benchmark"]["analysis"]["deletionRate"],
+        insertionRate=config["benchmark"]["analysis"]["insertionRate"],
+        doubletRate=config["benchmark"]["analysis"]["doubletRate"]
+    script:
+        "scripts/gather_ado_calling_results_part.py"
+
+# Rule: gather ADO calling results from IndelSIEVE stage 2 with candidate SNVs per configuration
+rule gatherIndelSieveStage2AdoResultsCandidateSNVsPerConfig:
+    input:
+        allFiles=expand(INDELSIEVEFROMCANDIDATEVARCALSTAGE2DIR + "{{fineTuneTypeIndelSieve}}/{{dataType}}/{runTemplateStage1}-{runTemplateStage2}/{{datasetName}}/stage2_files", zip, runTemplateStage1=STAGE1TEMPLATES, runTemplateStage2=STAGE2TEMPLATES),
+        trueCellNames=expand(f'{SIMUTUMORCELLNAMESDIR}{config["benchmark"]["simulation"]["tumorCellNamesPre"]}.{{datasetName}}', datasetName=SIMUDATASETNAMES)
+    output:
+        temp(ANALYSISADOCALLDIR + "{fineTuneTypeIndelSieve}/{dataType}/{datasetName}/from_indelsieve_stage2_" + config["benchmark"]["analysis"]["candidateSNVs"] + ".tsv")
+    params:
+        datasetNames=lambda wildcards: [wildcards.datasetName],
+        tool=CONFIG2KEY,
+        snvType=config["benchmark"]["analysis"]["candidateSNVs"],
+        toolSetup=expand("{runTemplateStage1}-{runTemplateStage2}", zip, runTemplateStage1=STAGE1TEMPLATES, runTemplateStage2=STAGE2TEMPLATES),
+        fineTuneType=lambda wildcards: [wildcards.fineTuneTypeIndelSieve],
+        cnvRate=str(config["fineTune"]["simulateCNVs"]["prob"]),
+        dataType=lambda wildcards: [wildcards.dataType],
+        trueAdoStatesPre=SIMUTRUEADOSTATESDIR + config["benchmark"]["simulation"]["trueAdoStatesPre"],
+        cellNum=config["benchmark"]["analysis"]["cellNum"],
+        covMean=config["benchmark"]["analysis"]["covMean"],
+        covVariance=config["benchmark"]["analysis"]["covVariance"],
+        effSeqErrRate=config["benchmark"]["analysis"]["effSeqErrRate"],
+        adoRate=config["benchmark"]["analysis"]["adoRate"],
+        mutationRate=config["benchmark"]["analysis"]["mutationRate"],
+        deletionRate=config["benchmark"]["analysis"]["deletionRate"],
+        insertionRate=config["benchmark"]["analysis"]["insertionRate"],
+        doubletRate=config["benchmark"]["analysis"]["doubletRate"]
+    script:
+        "scripts/gather_ado_calling_results_part.py"
+
+# Rule: gather ADO calling results from IndelSIEVE stage 2 with candidate SNVs
+rule gatherIndelSieveStage2AdoResultsCandidateSNVs:
+    input:
+        expand(ANALYSISADOCALLDIR + "{fineTuneTypeIndelSieve}/{dataType}/{datasetName}/from_indelsieve_stage2_" + config["benchmark"]["analysis"]["candidateSNVs"] + ".tsv", fineTuneTypeIndelSieve=FINETUNETYPESINDELSIEVE, dataType=SIMUDATATYPES, datasetName=SIMUDATASETNAMES)
+    output:
+        protected(ANALYSISADOCALLDIR + "from_indelsieve_stage2_" + config["benchmark"]["analysis"]["candidateSNVs"] + ".tsv")
+    script:
+        "scripts/gather_ado_calling_results.py"
+
+
+#########################################################
+#                                                       #
+#        Get allelic information from IndelSIEVE        #
+#                                                       #
+#########################################################
+
+# Rule: generate allelic information per cell from true allelic sequencing information and true size factorand IndelSIEVE results
+rule generateAllelicInfoPerCell:
+    input:
+        cellNames=f'{SIMUTUMORCELLNAMESDIR}{config["benchmark"]["simulation"]["tumorCellNamesPre"]}.{{datasetName}}',
+        trueSizeFactors=SIMUTRUESIZEFACTORSDIR + config["benchmark"]["simulation"]["trueSizeFactorsPre"] + ".{datasetName}",
+        trueAllelicSeqInfo=SIMUALLELICSEQINFODIR + config["benchmark"]["simulation"]["trueAllelicSeqInfoSNVsPre"] + ".{datasetName}",
+        indelsieveVarCallFiles=INDELSIEVEFROMCANDIDATEVARCALSTAGE2DIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplateStage1}-{runTemplateStage2}/{datasetName}/stage2_files"
+    output:
+        temp(INDELSIEVEFROMCANDIDATEVARCALSTAGE2DIR + "{fineTuneTypeIndelSieve}/{dataType}/{runTemplateStage1}-{runTemplateStage2}/{datasetName}/allelic_info.rds")
+    params:
+        tool="indelsieve",
+        toolSetup=lambda wildcards: "{runTemplateStage1}-{runTemplateStage2}".format(runTemplateStage1=wildcards.runTemplateStage1, runTemplateStage2=wildcards.runTemplateStage2),
+        datasetLabel=lambda wildcards: "{datasetName}".format(datasetName=wildcards.datasetName),
+        fineTuneType=lambda wildcards: "{fineTuneTypeIndelSieve}".format(fineTuneTypeIndelSieve=wildcards.fineTuneTypeIndelSieve),
+        dataType=lambda wildcards: "{dataType}".format(dataType=wildcards.dataType),
+        cellNum=config["benchmark"]["analysis"]["cellNum"],
+        covMean=config["benchmark"]["analysis"]["covMean"],
+        covVariance=config["benchmark"]["analysis"]["covVariance"],
+        effSeqErrRate=config["benchmark"]["analysis"]["effSeqErrRate"],
+        adoRate=config["benchmark"]["analysis"]["adoRate"],
+        mutationRate=config["benchmark"]["analysis"]["mutationRate"],
+        deletionRate=config["benchmark"]["analysis"]["deletionRate"],
+        insertionRate=config["benchmark"]["analysis"]["insertionRate"],
+        doubletRate=config["benchmark"]["analysis"]["doubletRate"],
+        cnvRate=str(config["fineTune"]["simulateCNVs"]["prob"])
+    script:
+        "scripts/generate_allelic_info_per_cell.R"
+
+# Rule: combine allelic information per cell from each 2 stage run
+rule combineAllelicInfoPerCellPerConfig:
+    input:
+        expand(INDELSIEVEFROMCANDIDATEVARCALSTAGE2DIR + "{{fineTuneTypeIndelSieve}}/{{dataType}}/{runTemplateStage1}-{runTemplateStage2}/{{datasetName}}/allelic_info.rds", zip, runTemplateStage1=STAGE1TEMPLATES, runTemplateStage2=STAGE2TEMPLATES)
+    output:
+        temp(ANALYSISALLELICINFO + "{fineTuneTypeIndelSieve}/{dataType}/{datasetName}/allelic_info.rds")
+    script:
+        "scripts/combine_allelic_info.R"
+
+# Rule: combine allelic information per cell from all datasets
+rule combineAllelicInfoPerCell:
+    input:
+        expand(ANALYSISALLELICINFO + "{fineTuneTypeIndelSieve}/{dataType}/{datasetName}/allelic_info.rds", fineTuneTypeIndelSieve=FINETUNETYPESINDELSIEVE, dataType=SIMUDATATYPES, datasetName=SIMUDATASETNAMES)
+    output:
+        protected(ANALYSISALLELICINFO + "allelic_info.rds")
+    script:
+        "scripts/combine_allelic_info.R"
+

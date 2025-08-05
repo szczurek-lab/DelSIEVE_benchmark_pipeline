@@ -1,0 +1,342 @@
+"""
+Explanation of wildcards:
+
+noCNVType: input data type without CNVs.
+CNVType: input data type with CNVs, e.g., including or excluding CNVs.
+datasetName: simulated dataset names, e.g., 0001, 0002, 0003...
+rawReadsFile: raw read file name (including the reference genome), e.g., tumcell0001.sam, healthycell.sam, reference.fasta...
+"""
+
+
+include: "scripts/constants.py"
+include: "scripts/utils.py"
+
+
+#########################################################
+#              Get categories of wildcards              #
+#########################################################
+
+SIMUDATASETNAMES = get_dataset_names(
+    SIMUSNVSITESDIR, config["fineTune"]["indelsieve_simulator"]["subsample"],
+)
+SIMUCNVTYPES = get_data_types(
+    config["benchmark"]["simulatedDataTypes"],
+    config["benchmark"]["simulation"]["dataTypes"]["CNVTypes"],
+    True,
+)
+SIMUNOCNVTYPES = get_data_types(
+    config["benchmark"]["simulatedDataTypes"],
+    config["benchmark"]["simulation"]["dataTypes"]["CNVTypes"],
+    False,
+)
+
+wildcard_constraints:
+    noCNVType='|'.join([re.escape(i) for i in SIMUNOCNVTYPES]) if SIMUNOCNVTYPES is not None and len(SIMUNOCNVTYPES) > 0 else NONE_PATTERN,
+    CNVType='|'.join([re.escape(i) for i in SIMUCNVTYPES]) if SIMUCNVTYPES is not None and len(SIMUCNVTYPES) > 0 else NONE_PATTERN
+
+
+#########################################################
+#               Subset true variant sites               #
+#########################################################
+
+# Rule: subset true variant sites to control the data size. This happens when the number of true variant sites is too large as a result of generating enough number of background sites.
+rule subsetTrueVariantSites:
+    input:
+        mpileupDir=SIMUMPILEUPDATADIR + "{datasetName}/",
+        trueSNVSites=SIMUSNVSITESDIR + config["benchmark"]["simulation"]["trueSNVSitesNamesPre"] + ".{datasetName}",
+        trueSNVEvoEvents=SIMUTRUESNVDIR + config["benchmark"]["simulation"]["trueSNVEvoEventsPre"] + ".{datasetName}",
+        trueSNVCov=SIMUTRUESNVDIR + config["benchmark"]["simulation"]["trueSNVCovPre"] + ".{datasetName}",
+        trueSNVGenotypesAL=SIMUTRUESNVDIR + config["benchmark"]["simulation"]["trueSNVGenotypesALPre"] + ".{datasetName}",
+        trueSNVGenotypesNU=SIMUTRUESNVDIR + config["benchmark"]["simulation"]["trueSNVGenotypesNUPre"] + ".{datasetName}",
+        trueSNVGenotypesTer=SIMUTRUESNVDIR + config["benchmark"]["simulation"]["trueSNVGenotypesTerPre"] + ".{datasetName}"
+    output:
+        mpileupDir=directory(SIMUDATATYPESDIR + "__subset/{datasetName}/"),
+        trueSNVSites=protected(SIMUDATATYPESDIR + "__subset/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVSitesNamesPre"] + ".{datasetName}"),
+        trueSNVEvoEvents=protected(SIMUDATATYPESDIR + "__subset/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVEvoEventsPre"] + ".{datasetName}"),
+        trueSNVCov=protected(SIMUDATATYPESDIR + "__subset/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVCovPre"] + ".{datasetName}"),
+        trueSNVGenotypesAL=protected(SIMUDATATYPESDIR + "__subset/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVGenotypesALPre"] + ".{datasetName}"),
+        trueSNVGenotypesNU=protected(SIMUDATATYPESDIR + "__subset/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVGenotypesNUPre"] + ".{datasetName}"),
+        trueSNVGenotypesTer=protected(SIMUDATATYPESDIR + "__subset/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVGenotypesTerPre"] + ".{datasetName}")
+    params:
+        prefix=SIMUDATATYPESDIR + "__subset/{datasetName}/",
+        options=lambda wildcards: get_subset_option(
+            config["fineTune"]["subsetTrueVarSites"]["targetedTrueVarSitesNum"],
+            config["fineTune"]["subsetTrueVarSites"]["targetedBg2varRatio"]
+        ),
+        seed=config["fineTune"]["subsetTrueVarSites"]["seed"]
+    log:
+        SIMUDATATYPESDIR + "__subset/logs/{datasetName}.out"
+    shell:
+        "python scripts/subset_true_variant_sites.py "
+        "--prefix {params.prefix} "
+        "{params.options} "
+        "--inPileupDir {input.mpileupDir} "
+        "--trueVarSites {input.trueSNVSites} "
+        "--addTrueInfo {input.trueSNVEvoEvents},{input.trueSNVCov},{input.trueSNVGenotypesAL},{input.trueSNVGenotypesNU},{input.trueSNVGenotypesTer} "
+        "--seed {params.seed} &>{log}"
+
+
+#########################################################
+#             Reorganize the simulated data             #
+#########################################################
+
+# Rule: copy simulated mapped reads data to another directory for consistency reasons.
+rule copySimulatedMappedReadsData:
+    input:
+        SIMURAWDATADIR + "{datasetName}/{rawReadsFile}"
+    output:
+        protected(SIMUDATATYPESDIR + "{noCNVType}/{datasetName}/" + config["benchmark"]["simulation"]["dataTypes"]["mappedReadsDir"] + "{rawReadsFile}")
+    shell:
+        "cp -f {input} {output}"
+
+def get_subset_files(
+    datasetName,
+    targetedTrueVarSitesNum: None|int,
+    targetedBg2varRatio: None|float,
+    for_cnv: bool,
+) -> dict[str, str]:
+    if targetedTrueVarSitesNum is None and targetedBg2varRatio is None:
+        ret = {
+            'mpileupDir': f'{SIMUMPILEUPDATADIR}{datasetName}/',
+            'trueSNVSites': f'{SIMUSNVSITESDIR}{config["benchmark"]["simulation"]["trueSNVSitesNamesPre"]}.{datasetName}',
+            'trueSNVEvoEvents': f'{SIMUTRUESNVDIR}{config["benchmark"]["simulation"]["trueSNVEvoEventsPre"]}.{datasetName}',
+            'trueSNVGenotypesAL': f'{SIMUTRUESNVDIR}{config["benchmark"]["simulation"]["trueSNVGenotypesALPre"]}.{datasetName}'
+        }
+
+        if not for_cnv:
+            ret.update(
+                {
+                    'trueSNVCov': f'{SIMUTRUESNVDIR}{config["benchmark"]["simulation"]["trueSNVCovPre"]}.{datasetName}',
+                    'trueSNVGenotypesNU': f'{SIMUTRUESNVDIR}{config["benchmark"]["simulation"]["trueSNVGenotypesNUPre"]}.{datasetName}',
+                    'trueSNVGenotypesTer': f'{SIMUTRUESNVDIR}{config["benchmark"]["simulation"]["trueSNVGenotypesTerPre"]}.{datasetName}'
+                }
+            )
+    else:
+        ret = {
+            'mpileupDir': f'{SIMUDATATYPESDIR}__subset/{datasetName}/',
+            'trueSNVSites': f'{SIMUDATATYPESDIR}__subset/{datasetName}/{config["benchmark"]["simulation"]["trueSNVSitesNamesPre"]}.{datasetName}',
+            'trueSNVEvoEvents': f'{SIMUDATATYPESDIR}__subset/{datasetName}/{config["benchmark"]["simulation"]["trueSNVEvoEventsPre"]}.{datasetName}',
+            'trueSNVGenotypesAL': f'{SIMUDATATYPESDIR}__subset/{datasetName}/{config["benchmark"]["simulation"]["trueSNVGenotypesALPre"]}.{datasetName}'
+        }
+
+        if not for_cnv:
+            ret.update(
+                {
+                    'trueSNVCov': f'{SIMUDATATYPESDIR}__subset/{datasetName}/{config["benchmark"]["simulation"]["trueSNVCovPre"]}.{datasetName}',
+                    'trueSNVGenotypesNU': f'{SIMUDATATYPESDIR}__subset/{datasetName}/{config["benchmark"]["simulation"]["trueSNVGenotypesNUPre"]}.{datasetName}',
+                    'trueSNVGenotypesTer': f'{SIMUDATATYPESDIR}__subset/{datasetName}/{config["benchmark"]["simulation"]["trueSNVGenotypesTerPre"]}.{datasetName}'
+                }
+            )
+
+    if for_cnv:
+        ret.update(
+            {
+                'tumCellNames': f'{SIMUTUMORCELLNAMESDIR}{config["benchmark"]["simulation"]["tumorCellNamesPre"]}.{datasetName}',
+            }
+        )
+
+    return ret
+
+# Rule: copy simulated mpileup data to another directory for consistency reasons.
+rule copySimulatedPileupData:
+    input:
+        unpack(lambda wildcards: get_subset_files(
+            wildcards.datasetName,
+            config["fineTune"]["subsetTrueVarSites"]["targetedTrueVarSitesNum"],
+            config["fineTune"]["subsetTrueVarSites"]["targetedBg2varRatio"],
+            False
+        ))
+    output:
+        mpileupDir=directory(SIMUDATATYPESDIR + "{noCNVType}/{datasetName}/" + config["benchmark"]["simulation"]["MPileUpDataDir"]),
+        trueSNVSites=protected(SIMUDATATYPESDIR + "{noCNVType}/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVSitesNamesPre"]),
+        trueSNVEvoEvents=protected(SIMUDATATYPESDIR + "{noCNVType}/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVEvoEventsPre"]),
+        trueSNVCov=protected(SIMUDATATYPESDIR + "{noCNVType}/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVCovPre"]),
+        trueSNVGenotypesAL=protected(SIMUDATATYPESDIR + "{noCNVType}/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVGenotypesALPre"]),
+        trueSNVGenotypesNU=protected(SIMUDATATYPESDIR + "{noCNVType}/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVGenotypesNUPre"]),
+        trueSNVGenotypesTer=protected(SIMUDATATYPESDIR + "{noCNVType}/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVGenotypesTerPre"])
+    script:
+        'scripts/copy_simulated_pileup_data.py'
+
+# Rule: gather copied simulated data.
+rule gatherCopiedSimulatedData:
+    input:
+        # mappedReadsFile=expand(SIMUDATATYPESDIR + "{noCNVType}/{datasetName}/{rawReadsFile}", noCNVType=SIMUNOCNVTYPES, datasetName=SIMUDATASETNAMES, rawReadsFile=RAWREADSFILES),
+        mpileupDir=expand(SIMUDATATYPESDIR + "{noCNVType}/{datasetName}/" + config["benchmark"]["simulation"]["MPileUpDataDir"], noCNVType=SIMUNOCNVTYPES, datasetName=SIMUDATASETNAMES),
+        trueSNVSites=expand(SIMUDATATYPESDIR + "{noCNVType}/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVSitesNamesPre"], noCNVType=SIMUNOCNVTYPES, datasetName=SIMUDATASETNAMES),
+        trueSNVEvoEvents=expand(SIMUDATATYPESDIR + "{noCNVType}/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVEvoEventsPre"], noCNVType=SIMUNOCNVTYPES, datasetName=SIMUDATASETNAMES),
+        trueSNVCov=expand(SIMUDATATYPESDIR + "{noCNVType}/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVCovPre"], noCNVType=SIMUNOCNVTYPES, datasetName=SIMUDATASETNAMES),
+        trueSNVGenotypesAL=expand(SIMUDATATYPESDIR + "{noCNVType}/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVGenotypesALPre"], noCNVType=SIMUNOCNVTYPES, datasetName=SIMUDATASETNAMES),
+        trueSNVGenotypesNU=expand(SIMUDATATYPESDIR + "{noCNVType}/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVGenotypesNUPre"], noCNVType=SIMUNOCNVTYPES, datasetName=SIMUDATASETNAMES),
+        trueSNVGenotypesTer=expand(SIMUDATATYPESDIR + "{noCNVType}/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVGenotypesTerPre"], noCNVType=SIMUNOCNVTYPES, datasetName=SIMUDATASETNAMES)
+    output:
+        protected(SIMUDATATYPESDIR + "NO_CNV_DONE_FLAG")
+    shell:
+        "touch {output}"
+
+# Rule: add CNVs to the simulated data.
+rule addCNVs2SimulatedData:
+    input:
+        unpack(lambda wildcards: get_subset_files(
+            wildcards.datasetName,
+            config["fineTune"]["subsetTrueVarSites"]["targetedTrueVarSitesNum"],
+            config["fineTune"]["subsetTrueVarSites"]["targetedBg2varRatio"],
+            True
+        ))
+    output:
+        # mappedReadsDir=directory(SIMUDATATYPESDIR + "{CNVType}/{datasetName}/" + config["benchmark"]["simulation"]["dataTypes"]["mappedReadsDir"]),
+        mpileupDir=directory(SIMUDATATYPESDIR + "{CNVType}/{datasetName}/" + config["benchmark"]["simulation"]["MPileUpDataDir"]),
+        trueSNVSites=protected(SIMUDATATYPESDIR + "{CNVType}/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVSitesNamesPre"]),
+        trueSNVEvoEvents=protected(SIMUDATATYPESDIR + "{CNVType}/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVEvoEventsPre"]),
+        trueSNVCov=protected(SIMUDATATYPESDIR + "{CNVType}/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVCovPre"]),
+        trueSNVGenotypesAL=protected(SIMUDATATYPESDIR + "{CNVType}/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVGenotypesALPre"]),
+        trueSNVGenotypesNU=protected(SIMUDATATYPESDIR + "{CNVType}/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVGenotypesNUPre"]),
+        trueSNVGenotypesTer=protected(SIMUDATATYPESDIR + "{CNVType}/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVGenotypesTerPre"])
+    params:
+        prob=eval(config["fineTune"]["simulateCNVs"]["prob"]) if type(config["fineTune"]["simulateCNVs"]["prob"]) == str else config["fineTune"]["simulateCNVs"]["prob"],
+        minCNVNum=config["fineTune"]["simulateCNVs"]["minNum"],
+        maxCNVNum=config["fineTune"]["simulateCNVs"]["maxNum"],
+        seed=config["fineTune"]["simulateCNVs"]["seed"],
+        prefix=SIMUDATATYPESDIR,
+        incCNVLabel=config["benchmark"]["simulation"]["dataTypes"]["CNVTypes"]["incCNV"]["dir"].rstrip("/"),
+        excCNVLabel=config["benchmark"]["simulation"]["dataTypes"]["CNVTypes"]["excCNV"]["dir"].rstrip("/"),
+        keep=lambda wildcards: get_cnv_keep_type(
+            wildcards.CNVType,
+            config["benchmark"]["simulation"]["dataTypes"]["CNVTypes"],
+        )
+    shell:
+        "python scripts/add_cnvs_2_simulated_data.py "
+        "--reads_dir {input.mpileupDir} "
+        "--cell_names {input.tumCellNames} "
+        "--snvs {input.trueSNVSites} "
+        "--gts {input.trueSNVGenotypesAL} "
+        "--evo {input.trueSNVEvoEvents} "
+        "--prob {params.prob} "
+        "--cnvs {params.minCNVNum} {params.maxCNVNum} "
+        "--seed {params.seed} "
+        "--prefix {params.prefix} "
+        "--inccnvlabel {params.incCNVLabel} "
+        "--exccnvlabel {params.excCNVLabel} "
+        "--keep {params.keep}"
+
+# Rule: gather simulated data with CNVs added.
+rule gatherAddedCNVs2SimulatedData:
+    input:
+        mpileupDir=expand(SIMUDATATYPESDIR + "{CNVType}/{datasetName}/" + config["benchmark"]["simulation"]["MPileUpDataDir"], CNVType=SIMUCNVTYPES, datasetName=SIMUDATASETNAMES),
+        trueSNVSites=expand(SIMUDATATYPESDIR + "{CNVType}/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVSitesNamesPre"], CNVType=SIMUCNVTYPES, datasetName=SIMUDATASETNAMES),
+        trueSNVEvoEvents=expand(SIMUDATATYPESDIR + "{CNVType}/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVEvoEventsPre"], CNVType=SIMUCNVTYPES, datasetName=SIMUDATASETNAMES),
+        trueSNVCov=expand(SIMUDATATYPESDIR + "{CNVType}/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVCovPre"], CNVType=SIMUCNVTYPES, datasetName=SIMUDATASETNAMES),
+        trueSNVGenotypesAL=expand(SIMUDATATYPESDIR + "{CNVType}/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVGenotypesALPre"], CNVType=SIMUCNVTYPES, datasetName=SIMUDATASETNAMES),
+        trueSNVGenotypesNU=expand(SIMUDATATYPESDIR + "{CNVType}/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVGenotypesNUPre"], CNVType=SIMUCNVTYPES, datasetName=SIMUDATASETNAMES),
+        trueSNVGenotypesTer=expand(SIMUDATATYPESDIR + "{CNVType}/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVGenotypesTerPre"], CNVType=SIMUCNVTYPES, datasetName=SIMUDATASETNAMES)
+    output:
+        protected(SIMUDATATYPESDIR + "CNV_DONE_FLAG")
+    shell:
+        "touch {output}"
+
+def gather_simulated_data(wildcards=None):
+    cnv_type_flag = SIMUCNVTYPES is not None and len(SIMUCNVTYPES) > 0
+    no_cnv_type_flag = SIMUNOCNVTYPES is not None and len(SIMUNOCNVTYPES) > 0
+
+    if cnv_type_flag and no_cnv_type_flag:
+        return [SIMUDATATYPESDIR + "CNV_DONE_FLAG", SIMUDATATYPESDIR + "NO_CNV_DONE_FLAG"]
+    elif cnv_type_flag:
+        return SIMUDATATYPESDIR + "CNV_DONE_FLAG"
+    elif no_cnv_type_flag:
+        return SIMUDATATYPESDIR + "NO_CNV_DONE_FLAG"
+    else:
+        raise ValueError('Empty values of "benchmark - simulatedDataTypes". Have at least one kept.')
+
+# Rule: gather simulated data.
+rule gatherSimulatedData:
+    input:
+        gather_simulated_data
+    output:
+        protected(SIMUDATATYPESDIR + "DONE_FLAG")
+    shell:
+        "touch {output}"
+
+# Rule: gather tumor cell names.
+rule gatherTumCellNames:
+    input:
+        expand(f'{SIMUTUMORCELLNAMESDIR}{config["benchmark"]["simulation"]["tumorCellNamesPre"]}.{{datasetName}}', datasetName=SIMUDATASETNAMES)
+    output:
+        protected(SIMUTUMORCELLNAMES)
+    script:
+        'scripts/gather_tum_cell_names.py'
+
+
+########################################################
+#             Summarize parallel mutations             #
+########################################################
+
+# Rule: gather the information of parallel mutations.
+rule gatherParallelMutations:
+    input:
+        trueSNVSites=expand(SIMUSNVSITESDIR + config["benchmark"]["simulation"]["trueSNVSitesNamesPre"] + ".{datasetName}", datasetName=SIMUDATASETNAMES),
+        parallelMuts=expand(SIMUPARALLELMUTDIR + config["benchmark"]["simulation"]["parallelMutPre"] + ".{datasetName}", datasetName=SIMUDATASETNAMES)
+    output:
+        protected(SIMUPARALLELMUTDIR + "summary.tsv")
+    params:
+        datasets=SIMUDATASETNAMES,
+        cellNum=config["benchmark"]["analysis"]["cellNum"],
+        covMean=config["benchmark"]["analysis"]["covMean"],
+        covVariance=config["benchmark"]["analysis"]["covVariance"],
+        effSeqErrRate=config["benchmark"]["analysis"]["effSeqErrRate"],
+        adoRate=config["benchmark"]["analysis"]["adoRate"],
+        mutationRate=config["benchmark"]["analysis"]["mutationRate"],
+        deletionRate=config["benchmark"]["analysis"]["deletionRate"],
+        insertionRate=config["benchmark"]["analysis"]["insertionRate"]
+    script:
+        "scripts/gather_parallel_mutations.R"
+
+
+########################################################
+#         Convert branch lengths of true trees         #
+########################################################
+
+# Rule: convert branch lengths of true trees measured from in the number of generations per site to in the number of mutations per site.
+rule convertTrueTreesWithTrunkWithoutNormal:
+    input:
+        SIMUTRUETREEDIR + config["benchmark"]["simulation"]["treesWithTrunkWithoutNormalDir"] + config["benchmark"]["simulation"]["treesPre"] + ".{datasetName}"
+    output:
+        protected(SIMUCONVERTEDTRUETREEDIR + config["benchmark"]["simulation"]["treesWithTrunkWithoutNormalDir"] + config["benchmark"]["simulation"]["treesPre"] + ".{datasetName}")
+    params:
+        mu=config["benchmark"]["analysis"]["mutationRate"]
+    shell:
+        "python scripts/convert_true_tree.py "
+        "-i {input} "
+        "-m {params.mu} "
+        "-o {output}"
+
+# Rule: convert branch lengths of true trees measured from in the number of generations per site to in the number of mutations per site.
+rule convertTrueTreesWithoutTrunkWithoutNormal:
+    input:
+        SIMUTRUETREEDIR + config["benchmark"]["simulation"]["treesWithoutTrunkWithoutNormalDir"] + config["benchmark"]["simulation"]["treesPre"] + ".{datasetName}"
+    output:
+        protected(SIMUCONVERTEDTRUETREEDIR + config["benchmark"]["simulation"]["treesWithoutTrunkWithoutNormalDir"] + config["benchmark"]["simulation"]["treesPre"] + ".{datasetName}")
+    params:
+        mu=config["benchmark"]["analysis"]["mutationRate"]
+    shell:
+        "python scripts/convert_true_tree.py "
+        "-i {input} "
+        "-m {params.mu} "
+        "-o {output}"
+
+
+#######################################################
+#               Get info from true data               #
+#######################################################
+
+# rule collectTrueSNVAdoInfo:
+#     input:
+#         snvSitesNames=SIMUSNVSITESDIR + config["benchmark"]["simulation"]["trueSNVSitesNamesPre"] + ".{datasetName}",
+#         cellNames=SIMUTUMORCELLNAMES,
+#         trueGenotypes=SIMUTRUESNVDIR + config["benchmark"]["simulation"]["trueSNVGenotypesNUPre"] + ".{datasetName}",
+#         trueAdoStates=SIMUTRUEADOSTATESDIR + config["benchmark"]["simulation"]["trueAdoStatesPre"] + ".{datasetName}"
+#     output:
+#         withAdoHetero=protected(SIMUTRUESNVADODIR + config["benchmark"]["simulation"]["trueSNVWithAdoHeteroPre"] + ".{datasetName}"),
+#         withoutAdoHetero=protected(SIMUTRUESNVADODIR + config["benchmark"]["simulation"]["trueSNVWithoutAdoHeteroPre"] + ".{datasetName}"),
+#         withAdoHomo=protected(SIMUTRUESNVADODIR + config["benchmark"]["simulation"]["trueSNVWithAdoHomoPre"] + ".{datasetName}"),
+#         withoutAdoHomo=protected(SIMUTRUESNVADODIR + config["benchmark"]["simulation"]["trueSNVWithoutAdoHomoPre"] + ".{datasetName}")
+#     script:
+#         "scripts/collect_true_snv_ado_info.py"

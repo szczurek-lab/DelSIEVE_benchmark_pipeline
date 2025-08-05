@@ -1,0 +1,261 @@
+"""
+Explanation of wildcards:
+
+dataType: input data types, e.g., no CNVs, including CNVs, excluding CNVs, etc.
+datasetName: simulated dataset names, e.g., 0001, 0002, 0003...
+"""
+
+
+include: "scripts/constants.py"
+include: "scripts/utils.py"
+
+
+#########################################################
+#              Get categories of wildcards              #
+#########################################################
+
+SIMUDATASETNAMES = get_dataset_names(SIMUSNVSITESDIR, config["fineTune"]["indelsieve_simulator"]["subsample"])
+SIMUDATATYPES = get_data_types(
+    config["benchmark"]["simulatedDataTypes"],
+    config["benchmark"]["simulation"]["dataTypes"]["CNVTypes"]
+)
+
+
+#######################################################
+#                       SCIPHIN                       #
+#######################################################
+
+# Rule: get a list of dummy bam file names
+rule getBamFileNamesSciphin:
+    input:
+        bamDir=SIMUDUMMYBAMDATADIR,
+        tumCellNames=f'{SIMUTUMORCELLNAMESDIR}{config["benchmark"]["simulation"]["tumorCellNamesPre"]}.{{datasetName}}'
+    output:
+        protected(f'{SCIPHINDIR}{config["benchmark"]["bamFileNamesWithoutNormal"]}.{{datasetName}}')
+    params:
+        tumorCellPre=config["benchmark"]["simulation"]["tumorCellDataPre"]
+    shell:
+        "python scripts/get_bam_file_names.py "
+        "--ibam {input.bamDir} "
+        "--icell {input.tumCellNames} "
+        "--type 2 "
+        "--prefix {params.tumorCellPre} "
+        "-o {output}"
+
+# Rule: run SCIPHIN
+rule runSciphin:
+    input:
+        # flagFile=SIMUDATATYPESDIR + "DONE_FLAG",
+        mpileupDir=SIMUDATATYPESDIR + "{dataType}/{datasetName}/" + config["benchmark"]["simulation"]["MPileUpDataDir"],
+        bamFileNames=f'{SCIPHINDIR}{config["benchmark"]["bamFileNamesWithoutNormal"]}.{{datasetName}}'
+    output:
+        vcf=protected(SCIPHINDIR + "{dataType}/{datasetName}/" + config["benchmark"]["sciphin"]["sciphinFilePre"] + ".vcf"),
+        model=protected(SCIPHINDIR + "{dataType}/{datasetName}/" + config["benchmark"]["sciphin"]["sciphinFilePre"] + ".params.txt"),
+        muProbs=protected(SCIPHINDIR + "{dataType}/{datasetName}/" + config["benchmark"]["sciphin"]["sciphinFilePre"] + ".probs"),
+        tree=protected(SCIPHINDIR + "{dataType}/{datasetName}/" + config["benchmark"]["sciphin"]["sciphinFilePre"] + "/best_index/tree.gv"),
+        readCounts=protected(SCIPHINDIR + "{dataType}/{datasetName}/" + config["benchmark"]["sciphin"]["sciphinFilePre"] + "/best_index/nuc.tsv")
+    params:
+        sciphin=config["tools"]["sciphin"],
+        mpileupFile=lambda wildcards, input: getMPileupWithoutNormal(
+            wildcards,
+            input,
+        ),
+        seed=config["fineTune"]["sciphin"]["seed"],
+        loops=config["fineTune"]["sciphin"]["loops"],
+        llp=config["fineTune"]["sciphin"]["llp"],
+        lpp=config["fineTune"]["sciphin"]["lpp"],
+        ese=config["fineTune"]["sciphin"]["ese"],
+        wildMean=config["fineTune"]["sciphin"]["wildMean"],
+        prefix=SCIPHINDIR + "{dataType}/{datasetName}/" + config["benchmark"]["sciphin"]["sciphinFilePre"]
+    benchmark:
+        repeat(EFFICIENCYSCIPHINDIR + "{dataType}/{datasetName}.tsv", config["benchmark"]["efficiency"]["repetition"])
+    log:
+        SCIPHINDIR + "{dataType}/{datasetName}/out"
+    shell:
+        "{params.sciphin} "
+        "--cwm 2 "
+        "-l {params.loops} "
+        "--seed {params.seed} "
+        "--lz 1 "
+        "--ll 1 "
+        "--lp 1 "
+        "--llp {params.llp} "
+        "--lpp {params.lpp} "
+        "--ese {params.ese} "
+        "--wildMean {params.wildMean} "
+        "--in {input.bamFileNames} "
+        "-o {params.prefix} "
+        "--im {params.mpileupFile} "
+        "&> {log}"
+
+# Rule: convert trees from SCIPHIN to NEXUS format
+rule convertSciphinTrees:
+    input:
+        SCIPHINDIR + "{dataType}/{datasetName}/" + config["benchmark"]["sciphin"]["sciphinFilePre"] + "/best_index/tree.gv"
+    output:
+        protected(SCIPHINDIR + "{dataType}/{datasetName}/" + config["benchmark"]["sciphin"]["sciphinFilePre"] + "/best_index/tree.nexus")
+    params:
+        leafNames=f'{SCIPHINDIR}{config["benchmark"]["bamFileNamesWithoutNormal"]}.{{datasetName}}'
+    shell:
+        "python scripts/convert_gv_2_nexus.py "
+        "--leafNames {params.leafNames} "
+        "--output {output} "
+        "{input}"
+
+# Rule: get variant calling information from SCIPHIN
+rule getSciphinVarInfo:
+    input:
+        vcf=SCIPHINDIR + "{dataType}/{datasetName}/" + config["benchmark"]["sciphin"]["sciphinFilePre"] + ".vcf"
+        # muProbs=SCIPHINDIR + "{dataType}/{datasetName}/" + config["benchmark"]["sciphin"]["sciphinFilePre"] + ".probs"
+    output:
+        cellNames=protected(SCIPHINDIR + "{dataType}/{datasetName}/post_processed/" + config["benchmark"]["sciphin"]["sciphinFilePre"] + ".cell_names"),
+        lociInfo=protected(SCIPHINDIR + "{dataType}/{datasetName}/post_processed/" + config["benchmark"]["sciphin"]["sciphinFilePre"] + ".loci_info"),
+        genotypes=protected(SCIPHINDIR + "{dataType}/{datasetName}/post_processed/" + config["benchmark"]["sciphin"]["sciphinFilePre"] + ".genotypes"),
+        ternary=protected(SCIPHINDIR + "{dataType}/{datasetName}/post_processed/" + config["benchmark"]["sciphin"]["sciphinFilePre"] + ".ternary"),
+        genotypeProbs=protected(SCIPHINDIR + "{dataType}/{datasetName}/post_processed/" + config["benchmark"]["sciphin"]["sciphinFilePre"] + ".genotype_probs"),
+        sifitData=protected(SCIPHINDIR + "{dataType}/{datasetName}/post_processed/" + config["benchmark"]["sciphin"]["sciphinFilePre"] + ".sifit_data"),
+        sifitCellNames=protected(SCIPHINDIR + "{dataType}/{datasetName}/post_processed/" + config["benchmark"]["sciphin"]["sciphinFilePre"] + ".sifit_cell_names")
+    params:
+        prefix=SCIPHINDIR + "{dataType}/{datasetName}/post_processed/" + config["benchmark"]["sciphin"]["sciphinFilePre"]
+    shell:
+        "python scripts/extract_info_from_vcf.py "
+        "--mode sciphin "
+        "--prefix {params.prefix} "
+        # "--probs {input.muProbs} "
+        "--sifit t "
+        "{input.vcf}"
+
+
+#######################################################
+#       Gather the number of sites from SCIPHIN       #
+#######################################################
+
+rule gatherSitesInfoSciphin:
+    input:
+        trueSites=expand(SIMUDATATYPESDIR + "{dataType}/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVSitesNamesPre"], dataType=SIMUDATATYPES, datasetName=SIMUDATASETNAMES),
+        candidateSites=expand(SCIPHINDIR + "{dataType}/{datasetName}/" + config["benchmark"]["sciphin"]["sciphinFilePre"] + "/best_index/nuc.tsv", dataType=SIMUDATATYPES, datasetName=SIMUDATASETNAMES)
+    output:
+        protected(ANALYSISSITESINFODIR + "from_sciphin.tsv")
+    params:
+        datasetNames=SIMUDATASETNAMES,
+        tool="sciphin",
+        snvType=config["benchmark"]["analysis"]["candidateSNVs"],
+        toolSetup=None,
+        fineTuneType=None,
+        cnvRate=str(config["fineTune"]["simulateCNVs"]["prob"]),
+        dataType=SIMUDATATYPES,
+        cellNum=config["benchmark"]["analysis"]["cellNum"],
+        covMean=config["benchmark"]["analysis"]["covMean"],
+        covVariance=config["benchmark"]["analysis"]["covVariance"],
+        effSeqErrRate=config["benchmark"]["analysis"]["effSeqErrRate"],
+        adoRate=config["benchmark"]["analysis"]["adoRate"],
+        mutationRate=config["benchmark"]["analysis"]["mutationRate"],
+        deletionRate=config["benchmark"]["analysis"]["deletionRate"],
+        insertionRate=config["benchmark"]["analysis"]["insertionRate"],
+        doubletRate=config["benchmark"]["analysis"]["doubletRate"],
+        typeOfQuery=config["benchmark"]["indelsieve"]["typeOfQuery"]
+    script:
+        "scripts/gather_sites_info_part.py"
+
+
+#######################################################
+#              Gather trees from SCIPHIN              #
+#######################################################
+
+# Rule: gather inferred trees from SCIPHIN
+rule gatherSciphinTrees:
+    input:
+        inferredTrees = expand(SCIPHINDIR + "{dataType}/{datasetName}/" + config["benchmark"]["sciphin"]["sciphinFilePre"] + "/best_index/tree.nexus", dataType=SIMUDATATYPES, datasetName=SIMUDATASETNAMES),
+        trueTrees = expand(SIMUCONVERTEDTRUETREEDIR + config["benchmark"]["simulation"]["treesWithTrunkWithoutNormalDir"] + config["benchmark"]["simulation"]["treesPre"] + ".{datasetName}", datasetName=SIMUDATASETNAMES)
+    output:
+        protected(ANALYSISTREECOMPDIR + "from_sciphin.tsv")
+    params:
+        datasetNames=SIMUDATASETNAMES,
+        trueTreesDir=SIMUCONVERTEDTRUETREEDIR + config["benchmark"]["simulation"]["treesWithTrunkWithoutNormalDir"],
+        trueTreesPre=config["benchmark"]["simulation"]["treesPre"],
+        tool="sciphin",
+        snvType=config["benchmark"]["analysis"]["candidateSNVs"],
+        toolSetup=None,
+        fineTuneType=None,
+        cnvRate=str(config["fineTune"]["simulateCNVs"]["prob"]),
+        dataType=SIMUDATATYPES,
+        cellNum=config["benchmark"]["analysis"]["cellNum"],
+        covMean=config["benchmark"]["analysis"]["covMean"],
+        covVariance=config["benchmark"]["analysis"]["covVariance"],
+        effSeqErrRate=config["benchmark"]["analysis"]["effSeqErrRate"],
+        adoRate=config["benchmark"]["analysis"]["adoRate"],
+        mutationRate=config["benchmark"]["analysis"]["mutationRate"],
+        deletionRate=config["benchmark"]["analysis"]["deletionRate"],
+        insertionRate=config["benchmark"]["analysis"]["insertionRate"],
+        doubletRate=config["benchmark"]["analysis"]["doubletRate"]
+    script:
+        "scripts/gather_inferred_trees_part.py"
+
+
+########################################################
+#              Get estimates from SCIPHIN              #
+########################################################
+
+# Rule: get parameter estimates from SCIPHIN
+rule getSciphinParams:
+    input:
+        expand(SCIPHINDIR + "{dataType}/{datasetName}/" + config["benchmark"]["sciphin"]["sciphinFilePre"] + ".params.txt", dataType=SIMUDATATYPES, datasetName=SIMUDATASETNAMES)
+    output:
+        protected(ANALYSISPARAMSDIR + "from_sciphin.tsv")
+    params:
+        cellNum=config["benchmark"]["analysis"]["cellNum"],
+        covMean=config["benchmark"]["analysis"]["covMean"],
+        covVariance=config["benchmark"]["analysis"]["covVariance"],
+        mutationRate=config["benchmark"]["analysis"]["mutationRate"],
+        datasetNames=SIMUDATASETNAMES,
+        tool="sciphin",
+        snvType=config["benchmark"]["analysis"]["candidateSNVs"],
+        toolSetup=None,
+        fineTuneType=None,
+        cnvRate=str(config["fineTune"]["simulateCNVs"]["prob"]),
+        dataType=SIMUDATATYPES,
+        estimatesType=config["benchmark"]["analysis"]["estimatesTypeSciphi"],
+        doubletRate=config["benchmark"]["analysis"]["doubletRate"]
+    script:
+        "scripts/get_param_estimates_sciphi.py"
+
+
+########################################################
+#       Get variant calling results from SCIPHIN       #
+########################################################
+
+# Rule: gather variant calling results from SCIPHIN
+rule gatherSciphinVarResults:
+    input:
+        inputData=expand(SCIPHINDIR + "{dataType}/{datasetName}/" + config["benchmark"]["sciphin"]["sciphinFilePre"] + "/best_index/nuc.tsv", dataType=SIMUDATATYPES, datasetName=SIMUDATASETNAMES),
+        cellNames=expand(SCIPHINDIR + "{dataType}/{datasetName}/post_processed/" + config["benchmark"]["sciphin"]["sciphinFilePre"] + ".cell_names", dataType=SIMUDATATYPES, datasetName=SIMUDATASETNAMES),
+        lociInfo=expand(SCIPHINDIR + "{dataType}/{datasetName}/post_processed/" + config["benchmark"]["sciphin"]["sciphinFilePre"] + ".loci_info", dataType=SIMUDATATYPES, datasetName=SIMUDATASETNAMES),
+        genotypes=expand(SCIPHINDIR + "{dataType}/{datasetName}/post_processed/" + config["benchmark"]["sciphin"]["sciphinFilePre"] + ".genotypes", dataType=SIMUDATATYPES, datasetName=SIMUDATASETNAMES),
+        ternary=expand(SCIPHINDIR + "{dataType}/{datasetName}/post_processed/" + config["benchmark"]["sciphin"]["sciphinFilePre"] + ".ternary", dataType=SIMUDATATYPES, datasetName=SIMUDATASETNAMES),
+        genotypeProbs=expand(SCIPHINDIR + "{dataType}/{datasetName}/post_processed/" + config["benchmark"]["sciphin"]["sciphinFilePre"] + ".genotype_probs", dataType=SIMUDATATYPES, datasetName=SIMUDATASETNAMES),
+        trueCellNames=expand(f'{SIMUTUMORCELLNAMESDIR}{config["benchmark"]["simulation"]["tumorCellNamesPre"]}.{{datasetName}}', datasetName=SIMUDATASETNAMES),
+        trueSNVSites=expand(SIMUDATATYPESDIR + "{dataType}/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVSitesNamesPre"], dataType=SIMUDATATYPES, datasetName=SIMUDATASETNAMES),
+        trueSNVGenotypesNU=expand(SIMUDATATYPESDIR + "{dataType}/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVGenotypesNUPre"], dataType=SIMUDATATYPES, datasetName=SIMUDATASETNAMES),
+        trueSNVGenotypesTer=expand(SIMUDATATYPESDIR + "{dataType}/{datasetName}/" + config["benchmark"]["simulation"]["trueSNVGenotypesTerPre"], dataType=SIMUDATATYPES, datasetName=SIMUDATASETNAMES)
+    output:
+        protected(ANALYSISVARCALLDIR + "from_sciphin.tsv")
+    params:
+        forSieve=False,
+        datasetNames=SIMUDATASETNAMES,
+        tool="sciphin",
+        snvType=config["benchmark"]["analysis"]["candidateSNVs"],
+        toolSetup=None,
+        fineTuneType=None,
+        cnvRate=str(config["fineTune"]["simulateCNVs"]["prob"]),
+        dataType=SIMUDATATYPES,
+        cellNum=config["benchmark"]["analysis"]["cellNum"],
+        covMean=config["benchmark"]["analysis"]["covMean"],
+        covVariance=config["benchmark"]["analysis"]["covVariance"],
+        effSeqErrRate=config["benchmark"]["analysis"]["effSeqErrRate"],
+        adoRate=config["benchmark"]["analysis"]["adoRate"],
+        mutationRate=config["benchmark"]["analysis"]["mutationRate"],
+        deletionRate=config["benchmark"]["analysis"]["deletionRate"],
+        insertionRate=config["benchmark"]["analysis"]["insertionRate"],
+        doubletRate=config["benchmark"]["analysis"]["doubletRate"]
+    script:
+        "scripts/gather_variant_calling_results_part.py"

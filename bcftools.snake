@@ -1,0 +1,84 @@
+"""
+Explanation of wildcards:
+
+dataType: input data types, e.g., no CNVs, including CNVs, excluding CNVs, etc.
+datasetName: simulated dataset names, e.g., 0001, 0002, 0003...
+cellName: cell names, e.g., tumcell0001, healthycell...
+"""
+
+
+include: "scripts/constants.py"
+include: "scripts/utils.py"
+
+
+#########################################################
+#              Get categories of wildcards              #
+#########################################################
+
+SIMUDATASETNAMES = get_dataset_names(SIMUSNVSITESDIR, config["fineTune"]["indelsieve_simulator"]["subsample"])
+SIMUDATATYPES = get_data_types(
+    config["benchmark"]["simulatedDataTypes"],
+    config["benchmark"]["simulation"]["dataTypes"]["CNVTypes"]
+)
+SIMUCNVTYPES = get_data_types(
+    config["benchmark"]["simulatedDataTypes"],
+    config["benchmark"]["simulation"]["dataTypes"]["CNVTypes"],
+    True
+)
+SIMUNOCNVTYPES = get_data_types(
+    config["benchmark"]["simulatedDataTypes"],
+    config["benchmark"]["simulation"]["dataTypes"]["CNVTypes"],
+    False
+)
+CELLNAMES = get_tumor_cell_names(SIMUTUMORCELLNAMES)
+
+wildcard_constraints:
+    cellName='|'.join([re.escape(i) for i in CELLNAMES])
+
+
+########################################################
+#                       BCFTOOLS                       #
+########################################################
+
+# Function: get the FASTA file of the reference genome.
+def get_fasta_file(wildcards):
+    if wildcards.dataType in SIMUNOCNVTYPES:
+        return f'{SIMUDATATYPESDIR}{{dataType}}/{{datasetName}}/{config["benchmark"]["simulation"]["dataTypes"]["mappedReadsDir"]}{config["benchmark"]["simulation"]["refGenomeDataPre"]}{config["benchmark"]["simulation"]["refGenomeDataSuf"]}'
+    elif wildcards.dataType in SIMUNOCNVTYPES:
+        folder = checkpoints.addCNVs2SimulatedData.get(
+            CNVType=wildcards.dataType,
+            datasetName=wildcards.datasetName
+        ).output[0]
+        return os.path.join(folder, f'{config["benchmark"]["simulation"]["refGenomeDataPre"]}{config["benchmark"]["simulation"]["refGenomeDataSuf"]}')
+    else:
+        raise ValueError(f'Unknown dataType: {wildcards.dataType}.')
+
+# Rule:
+rule runBcfCall:
+    input:
+        bam=expand(SIMUDATATYPESDIR + "{{dataType}}/{{datasetName}}/" + config["benchmark"]["simulation"]["dataTypes"]["sortedBamDir"] + "{cellName}.bam", cellName=CELLNAMES),
+        fa=lambda wildcards: get_fasta_file(wildcards),
+        bamIdx=expand(SIMUDATATYPESDIR + "{{dataType}}/{{datasetName}}/" + config["benchmark"]["simulation"]["dataTypes"]["sortedBamDir"] + "{cellName}.bam.bai", cellName=CELLNAMES),
+        faIdx=SIMUDATATYPESDIR + "{dataType}/{datasetName}/" + config["benchmark"]["simulation"]["dataTypes"]["mappedReadsDir"] + config["benchmark"]["simulation"]["refGenomeDataPre"] + config["benchmark"]["simulation"]["refGenomeDataSuf"] + ".fai"
+    output:
+        protected(BCFTOOLSDIR + "{dataType}/{datasetName}/" + config["benchmark"]["bcftools"]["bcftoolsFilePre"] + ".vcf")
+    threads:
+        4
+    shell:
+        "bcftools mpileup -Ou -f {input.fa} {input.bam} | "
+        "bcftools call "
+        "--skip-variants snps "
+        "--multiallelic-caller "
+        "--variants-only "
+        "--threads {threads} "
+        "-Ov -o {output}"
+
+# Rule:
+rule gatherBcfCallResults:
+    input:
+        expand(BCFTOOLSDIR + "{dataType}/{datasetName}/" + config["benchmark"]["bcftools"]["bcftoolsFilePre"] + ".vcf", dataType=SIMUDATATYPES, datasetName=SIMUDATASETNAMES)
+    output:
+        protected(BCFTOOLSDIR + "TEST_DONE")
+    shell:
+        "touch {output}"
+
